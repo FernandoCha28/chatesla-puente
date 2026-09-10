@@ -1,0 +1,13 @@
+# Configuración lista para Render. No hay que tocar nada aquí.
+services:
+  - type: web
+    name: chatesla-puente
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn bridge:application --workers 1 --threads 4 --timeout 120 --bind 0.0.0.0:$PORT
+    envVars:
+      - key: PUENTE_TOKEN
+        sync: false          # lo escribes tú en el panel de Render
+      - key: PYTHON_VERSION
+        value: "3.11.9"

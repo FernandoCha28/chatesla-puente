@@ -1,0 +1,16 @@
+[Unit]
+Description=Chatesla VIP - puente hacia los brokers
+After=network.target
+
+[Service]
+Type=simple
+User=chatesla
+WorkingDirectory=/opt/chatesla-puente
+Environment="PUENTE_TOKEN=PON-AQUI-EL-MISMO-TOKEN-DE-config.php"
+Environment="PUENTE_VIDA=600"
+ExecStart=/opt/chatesla-puente/venv/bin/gunicorn -w 1 -t 120 -b 127.0.0.1:8100 bridge:application
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
