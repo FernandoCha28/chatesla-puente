@@ -1,9 +1,6 @@
-Flask>=3.0
-gunicorn>=21.2
+flask
+gunicorn
+requests
 websocket-client>=1.7
-requests>=2.31
-
-# Librerías de los brókeres (de la comunidad, no oficiales).
-# Si una URL cambia, se instala a mano:  pip install git+<url>
-exnovaapi @ git+https://github.com/CassDs/ExnovaAPI.git
-iqoptionapi @ git+https://github.com/Lu-Yi-Hsun/iqoptionapi.git
+git+https://github.com/CassDs/ExnovaAPI.git
+git+https://github.com/Lu-Yi-Hsun/iqoptionapi.git
