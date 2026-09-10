@@ -22,7 +22,7 @@ Seguridad:
 ============================================================
 """
 
-import os, time, threading, logging
+import os, ssl, time, threading, logging
 from flask import Flask, request, jsonify
 
 # ------------------------------------------------------------
@@ -30,7 +30,8 @@ from flask import Flask, request, jsonify
 # ------------------------------------------------------------
 TOKEN = os.environ.get("PUENTE_TOKEN", "").strip()
 VIDA_CONEXION = int(os.environ.get("PUENTE_VIDA", "600"))   # segundos
-ESPERA_BROKER = int(os.environ.get("PUENTE_ESPERA", "15"))  # tope al esperar al bróker
+ESPERA_BROKER = int(os.environ.get("PUENTE_ESPERA", "8"))   # tope de cada espera al bróker
+ESPERA_TOTAL  = int(os.environ.get("PUENTE_TOTAL", "22"))  # tope de toda la conexión
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s  %(levelname)s  %(message)s")
@@ -93,29 +94,139 @@ def _limpiar_viejas():
 # ------------------------------------------------------------
 def _parchear_exnova():
     """
-    La librería de Exnova espera la respuesta del bróker con un bucle sin
-    freno (`while self.profile.msg == None: pass`). Si el bróker no contesta
-    —por ejemplo con un SSID caducado— ese bucle no para nunca y se come el
-    procesador entero. Aquí se le pone un límite de tiempo y un respiro.
+    La librería de Exnova espera al bróker con bucles como este:
+
+        while self.profile.msg == None:
+            pass
+
+    Cuatro veces, sin pausa y sin límite de tiempo. Un bucle así gira a toda
+    velocidad y no suelta el intérprete de Python, así que el programa entero
+    se queda mudo: ni siquiera puede contestarle a la página. En un servidor
+    pequeño (como el plan gratis) eso lo tumba.
+
+    Aquí se cambian esos cuatro bucles por otros que descansan 50 milisegundos
+    entre vuelta y vuelta y se rinden pasado un tiempo. Es el mismo camino de
+    siempre, solo que respirando.
     """
     from exnovaapi.api import ExnovaAPI
+    from exnovaapi.stable_api import Exnova
+    from exnovaapi.ws.client import WebsocketClient
     import exnovaapi.global_value as gv
+    import requests
+
     if getattr(ExnovaAPI, "_adaptado", False):
         return
 
-    def send_ssid(self, limite=ESPERA_BROKER):
+    def esperar(mirar, limite):
+        """Repite `mirar()` hasta que dé algo, o hasta que se acabe el tiempo."""
+        fin = time.time() + limite
+        while time.time() < fin:
+            try:
+                r = mirar()
+                if r is not None:
+                    return r
+            except Exception:
+                pass
+            time.sleep(0.05)
+        return None
+
+    # 1) abrir el socket
+    def start_websocket(self):
+        gv.check_websocket_if_connect = None
+        gv.check_websocket_if_error = False
+        gv.websocket_error_reason = None
+
+        self.websocket_client = WebsocketClient(self)
+        self.websocket_thread = threading.Thread(
+            target=self.websocket.run_forever,
+            kwargs={"sslopt": {"check_hostname": False, "cert_reqs": ssl.CERT_NONE}})
+        self.websocket_thread.daemon = True
+        self.websocket_thread.start()
+
+        def estado():
+            if gv.check_websocket_if_error:
+                return (False, gv.websocket_error_reason or "Error de conexión")
+            if gv.check_websocket_if_connect == 0:
+                return (False, "El bróker cerró la conexión")
+            if gv.check_websocket_if_connect == 1:
+                return (True, None)
+            return None
+
+        return esperar(estado, ESPERA_BROKER) or (False, "El bróker no abrió la conexión a tiempo")
+
+    # 2) presentar el SSID
+    def send_ssid(self, limite=None):
         self.profile.msg = None
         self.ssid(gv.SSID)                     # pylint: disable=not-callable
-        fin = time.time() + limite
-        while self.profile.msg is None:
-            if time.time() > fin:
-                return False
-            time.sleep(0.05)
-        return self.profile.msg is not False
+        r = esperar(lambda: self.profile.msg, limite or ESPERA_BROKER)
+        return r is not None and r is not False
 
+    # 3) la conexión de bajo nivel, solo por SSID (sin usuario ni contraseña)
+    def connect(self):
+        gv.ssl_Mutual_exclusion = False
+        gv.ssl_Mutual_exclusion_write = False
+        try:
+            self.close()
+        except Exception:
+            pass
+
+        ok, razon = self.start_websocket()
+        if not ok:
+            return False, razon
+        if not gv.SSID:
+            return False, "Falta el SSID"
+        if not self.send_ssid():
+            return False, ("El bróker no aceptó el SSID. Casi siempre es que caducó: "
+                           "cópialo otra vez desde el bróker en Configuración.")
+
+        requests.utils.add_dict_to_cookiejar(self.session.cookies, {"ssid": gv.SSID})
+
+        # Ojo: leer `timesync.server_timestamp` de la forma normal también se
+        # queda colgado, porque esa propiedad espera por dentro. Se mira el
+        # valor guardado directamente, así la espera sí tiene tope.
+        self.timesync.server_timestamp = None
+        ts = self.timesync
+        if esperar(lambda: getattr(ts, "_TimeSync__server_timestamp", None), ESPERA_BROKER) is None:
+            return False, "El bróker no envió la hora del servidor"
+        return True, None
+
+    # 4) la conexión de alto nivel
+    def conectar(self, sms_code=None):
+        try:
+            self.api.close()
+        except Exception:
+            pass
+        self.api = ExnovaAPI("ws.trade.exnova.com", self.email, self.password)
+        self.api.set_session(headers=self.SESSION_HEADER, cookies=self.SESSION_COOKIE)
+
+        ok, razon = self.api.connect()
+        if not ok:
+            return False, razon
+
+        try:
+            self.re_subscribe_stream()
+        except Exception:
+            pass
+
+        # el número de la cuenta llega por el socket; si tarda, seguimos igual
+        if esperar(lambda: gv.balance_id, ESPERA_BROKER) is not None:
+            try:
+                self.position_change_all("subscribeMessage", gv.balance_id)
+            except Exception:
+                pass
+        try:
+            self.order_changed_all("subscribeMessage")
+            self.api.setOptions(1, True)
+        except Exception:
+            pass
+        return True, None
+
+    ExnovaAPI.start_websocket = start_websocket
     ExnovaAPI.send_ssid = send_ssid
+    ExnovaAPI.connect = connect
+    Exnova.connect = conectar
     ExnovaAPI._adaptado = True
-    log.info("exnovaapi: espera del bróker limitada a %ss", ESPERA_BROKER)
+    log.info("exnovaapi adaptado: bucles con pausa y tope de %ss", ESPERA_BROKER)
 
 
 def _parchear_iqoption():
@@ -188,7 +299,7 @@ def _abrir(broker, ssid):
         except Exception:
             pass
 
-    ok = False
+    ok, razon = False, None
     for nombre in ("connect_with_ssid", "connect_ssid", "login_with_ssid"):
         if hasattr(api, nombre):
             try:
@@ -201,20 +312,17 @@ def _abrir(broker, ssid):
     if not ok:
         try:
             r = api.connect()
-            ok = bool(r[0] if isinstance(r, tuple) else r)
+            if isinstance(r, tuple):
+                ok, razon = bool(r[0]), r[1]
+            else:
+                ok = bool(r)
         except Exception as e:
+            razon = str(e)
             log.warning("connect() falló: %s", e)
 
-    if not ok and hasattr(api, "api"):
-        try:
-            api.api.start_websocket()
-            time.sleep(2)
-            ok = api.check_connect()
-        except Exception as e:
-            log.warning("socket manual falló: %s", e)
-
     if not ok:
-        raise Aviso("No se pudo entrar con ese SSID. Suele pasar cuando el SSID "
+        raise Aviso(str(razon) if razon else
+                    "No se pudo entrar con ese SSID. Suele pasar cuando el SSID "
                     "caducó: vuelve a copiarlo desde el bróker en Configuración.")
 
     log.info("conectado a %s", broker)
@@ -227,7 +335,7 @@ def _abrir_vigilado(broker, ssid, limite=None):
     queda esperando al bróker, no arrastra al puente entero: se responde con
     un aviso y el hilo se abandona.
     """
-    limite = limite or (ESPERA_BROKER + 8)
+    limite = limite or ESPERA_TOTAL
     caja = {}
 
     def tarea():
@@ -471,4 +579,3 @@ def cerrar():
 # arranque suelto, para probar en tu computadora o en un VPS
 if __name__ == "__main__":
     application.run(host="127.0.0.1", port=8100)
-
