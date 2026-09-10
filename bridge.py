@@ -30,6 +30,7 @@ from flask import Flask, request, jsonify
 # ------------------------------------------------------------
 TOKEN = os.environ.get("PUENTE_TOKEN", "").strip()
 VIDA_CONEXION = int(os.environ.get("PUENTE_VIDA", "600"))   # segundos
+ESPERA_BROKER = int(os.environ.get("PUENTE_ESPERA", "15"))  # tope al esperar al bróker
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s  %(levelname)s  %(message)s")
@@ -90,19 +91,89 @@ def _limpiar_viejas():
 # prueban las formas conocidas, de la más nueva a la más vieja,
 # y si ninguna sirve se avisa con un mensaje claro.
 # ------------------------------------------------------------
+def _parchear_exnova():
+    """
+    La librería de Exnova espera la respuesta del bróker con un bucle sin
+    freno (`while self.profile.msg == None: pass`). Si el bróker no contesta
+    —por ejemplo con un SSID caducado— ese bucle no para nunca y se come el
+    procesador entero. Aquí se le pone un límite de tiempo y un respiro.
+    """
+    from exnovaapi.api import ExnovaAPI
+    import exnovaapi.global_value as gv
+    if getattr(ExnovaAPI, "_adaptado", False):
+        return
+
+    def send_ssid(self, limite=ESPERA_BROKER):
+        self.profile.msg = None
+        self.ssid(gv.SSID)                     # pylint: disable=not-callable
+        fin = time.time() + limite
+        while self.profile.msg is None:
+            if time.time() > fin:
+                return False
+            time.sleep(0.05)
+        return self.profile.msg is not False
+
+    ExnovaAPI.send_ssid = send_ssid
+    ExnovaAPI._adaptado = True
+    log.info("exnovaapi: espera del bróker limitada a %ss", ESPERA_BROKER)
+
+
+def _parchear_iqoption():
+    """
+    La librería de IQ Option está escrita para websocket-client 0.56, que
+    llamaba a las funciones con menos parámetros. Nosotros usamos la 1.8.0
+    (la que necesita Exnova), así que aquí se adaptan las llamadas.
+    """
+    from iqoptionapi.ws import client as c
+    K = c.WebsocketClient
+    if getattr(K, "_adaptado", False):
+        return
+    orig = {n: getattr(K, n) for n in ("on_message", "on_error", "on_open", "on_close")}
+
+    def on_message(self, *a):
+        return orig["on_message"](self, a[-1]) if a else None
+
+    def on_error(self, *a):
+        try:
+            return orig["on_error"](self, a[-1]) if a else None
+        except Exception:
+            return None
+
+    def on_open(self, *a):
+        try:
+            return orig["on_open"](self)
+        except Exception:
+            return None
+
+    def on_close(self, *a):
+        try:
+            return orig["on_close"](self)
+        except Exception:
+            return None
+
+    K.on_message, K.on_error = on_message, on_error
+    K.on_open, K.on_close = on_open, on_close
+    K._adaptado = True
+    log.info("iqoptionapi adaptado a websocket-client 1.x")
+
+
 def _abrir(broker, ssid):
     if broker == "iqoption":
         try:
             from iqoptionapi.stable_api import IQ_Option as Cliente
             import iqoptionapi.global_value as gv
-        except ImportError:
-            raise Aviso("Falta la librería iqoptionapi en el servidor", 500)
+            _parchear_iqoption()
+        except ImportError as e:
+            raise Aviso("La librería de IQ Option no está bien instalada en el "
+                        "servidor (%s). Revisa el Build Command." % e, 500)
     else:
         try:
             from exnovaapi.stable_api import Exnova as Cliente
             import exnovaapi.global_value as gv
-        except ImportError:
-            raise Aviso("Falta la librería exnovaapi en el servidor", 500)
+        except ImportError as e:
+            raise Aviso("La librería de Exnova no está bien instalada en el "
+                        "servidor (%s). Revisa el Build Command." % e, 500)
+        _parchear_exnova()
 
     api = Cliente("sesion@chatesla", "sesion")   # no se usa: entramos con SSID
 
@@ -150,6 +221,34 @@ def _abrir(broker, ssid):
     return api
 
 
+def _abrir_vigilado(broker, ssid, limite=None):
+    """
+    Abre la conexión en un hilo aparte con tope de tiempo. Si la librería se
+    queda esperando al bróker, no arrastra al puente entero: se responde con
+    un aviso y el hilo se abandona.
+    """
+    limite = limite or (ESPERA_BROKER + 8)
+    caja = {}
+
+    def tarea():
+        try:
+            caja["api"] = _abrir(broker, ssid)
+        except Aviso as e:
+            caja["aviso"] = e
+        except Exception as e:                       # noqa: BLE001
+            caja["aviso"] = Aviso("El bróker falló al conectar: %s" % e, 500)
+
+    h = threading.Thread(target=tarea, daemon=True)
+    h.start()
+    h.join(limite)
+    if h.is_alive():
+        raise Aviso("El bróker no contestó a tiempo. Suele ser el SSID caducado: "
+                    "cópialo otra vez desde el bróker en Configuración.", 504)
+    if "aviso" in caja:
+        raise caja["aviso"]
+    return caja["api"]
+
+
 def cliente(broker, ssid, cuenta):
     if not ssid:
         raise Aviso("Falta el SSID")
@@ -166,7 +265,7 @@ def cliente(broker, ssid, cuenta):
                 _conexiones.pop(k, None)
                 reg = None
         if not reg:
-            reg = {"api": _abrir(broker, ssid), "cuenta": None}
+            reg = {"api": _abrir_vigilado(broker, ssid), "cuenta": None}
             _conexiones[k] = reg
         reg["visto"] = time.time()
 
@@ -204,6 +303,43 @@ def _aviso(e):
 def raiz():
     return jsonify({"puente": "Chatesla VIP", "estado": "en pie",
                     "token": "puesto" if TOKEN else "FALTA"})
+
+
+@application.get("/diagnostico")
+def diagnostico():
+    """
+    Abre esto en el navegador para ver, de un vistazo, si las librerías
+    de los brókeres quedaron bien instaladas:
+        https://tu-puente.onrender.com/diagnostico
+    No hace falta token: no enseña ningún dato privado.
+    """
+    salida = {"puente": "en pie", "token": "puesto" if TOKEN else "FALTA", "librerias": {}}
+    try:
+        import websocket
+        salida["websocket_client"] = getattr(websocket, "__version__", "desconocida")
+    except Exception as e:
+        salida["websocket_client"] = "NO INSTALADA (%s)" % e
+
+    for nombre, ruta in (("exnova", "exnovaapi.stable_api"),
+                         ("iqoption", "iqoptionapi.stable_api")):
+        try:
+            __import__(ruta)
+            salida["librerias"][nombre] = "ok"
+        except Exception as e:
+            salida["librerias"][nombre] = "%s: %s" % (type(e).__name__, e)
+
+    # el fallo típico de Exnova: la carpeta http se queda fuera al instalar
+    try:
+        import exnovaapi.http  # noqa: F401
+        salida["exnovaapi_http"] = "ok"
+    except Exception as e:
+        salida["exnovaapi_http"] = ("FALTA — el Build Command no le puso el __init__.py "
+                                    "(%s)" % e)
+
+    salida["todo_bien"] = (salida["librerias"].get("exnova") == "ok"
+                           and salida.get("exnovaapi_http") == "ok"
+                           and TOKEN != "")
+    return jsonify(salida)
 
 
 @application.post("/estado")
@@ -335,3 +471,4 @@ def cerrar():
 # arranque suelto, para probar en tu computadora o en un VPS
 if __name__ == "__main__":
     application.run(host="127.0.0.1", port=8100)
+
