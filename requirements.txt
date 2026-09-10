@@ -1,6 +1,4 @@
-flask
-gunicorn
-requests
-websocket-client>=1.7
-git+https://github.com/CassDs/ExnovaAPI.git
-git+https://github.com/Lu-Yi-Hsun/iqoptionapi.git
+Flask>=3.0
+gunicorn>=21.2
+requests>=2.31
+websocket-client==1.8.0
