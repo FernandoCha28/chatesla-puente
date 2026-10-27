@@ -357,6 +357,30 @@ def _abrir_vigilado(broker, ssid, limite=None):
     return caja["api"]
 
 
+def con_tope(fn, limite=None, que="El bróker"):
+    """
+    Corre `fn()` con un tope de tiempo. Las librerías se quedan esperando al
+    bróker sin límite; esto asegura que la página siempre reciba respuesta.
+    """
+    limite = limite or ESPERA_TOTAL
+    caja = {}
+
+    def tarea():
+        try:
+            caja["r"] = fn()
+        except Exception as e:                       # noqa: BLE001
+            caja["e"] = e
+
+    h = threading.Thread(target=tarea, daemon=True)
+    h.start()
+    h.join(limite)
+    if h.is_alive():
+        raise Aviso("%s tardó demasiado en responder. Vuelve a intentarlo en un momento." % que, 504)
+    if "e" in caja:
+        raise caja["e"]
+    return caja.get("r")
+
+
 def cliente(broker, ssid, cuenta):
     if not ssid:
         raise Aviso("Falta el SSID")
@@ -474,12 +498,28 @@ def _perfil(api):
 def saldo():
     d, broker, cuenta, ssid = preparar()
     api = cliente(broker, ssid, cuenta)
+
+    def leer():
+        # se busca por tipo de cuenta (1 real, 4 demo) y no por la cuenta "activa"
+        # de la librería, que es una sola para todo el puente y la comparten
+        # todos los usuarios conectados a la vez
+        tipo = 1 if cuenta == "real" else 4
+        saldo, moneda = None, "USD"
+        try:
+            for b in (api.get_balances() or {}).get("msg") or []:
+                if b.get("type") == tipo:
+                    saldo, moneda = float(b.get("amount") or 0), b.get("currency") or "USD"
+                    break
+        except Exception:
+            pass
+        if saldo is None:
+            saldo = float(api.get_balance() or 0)
+        return {"ok": True, "saldo": saldo, "cuenta": cuenta, "moneda": moneda,
+                "perfil": _perfil(api)}
     try:
-        return jsonify({"ok": True,
-                        "saldo": float(api.get_balance() or 0),
-                        "cuenta": cuenta,
-                        "moneda": (api.get_currency() if hasattr(api, "get_currency") else "USD"),
-                        "perfil": _perfil(api)})
+        return jsonify(con_tope(leer, que="El saldo"))
+    except Aviso:
+        raise
     except Exception as e:
         raise Aviso("No se pudo leer el saldo: %s" % e, 500)
 
@@ -492,18 +532,27 @@ def historial():
     """
     d, broker, cuenta, ssid = preparar()
     api = cliente(broker, ssid, cuenta)
-    crudo = []
-    try:
+    def leer():
+        salida = []
         if hasattr(api, "get_optioninfo_v2"):
-            r = api.get_optioninfo_v2(100)
-            crudo = list((r or {}).get("msg", {}).get("closed_options", []))
-        if not crudo and hasattr(api, "get_position_history_v2"):
+            try:
+                r = api.get_optioninfo_v2(100)
+                salida = list((r or {}).get("msg", {}).get("closed_options", []))
+            except Exception as e:
+                log.warning("get_optioninfo_v2 falló: %s", e)
+        if not salida and hasattr(api, "get_position_history_v2"):
             for tipo in ("digital-option", "turbo-option", "binary-option"):
                 try:
                     _, arr = api.get_position_history_v2(tipo, 100, 0, 0, 0)
-                    crudo += list(arr or [])
+                    salida += list(arr or [])
                 except Exception:
                     pass
+        return salida
+
+    try:
+        crudo = con_tope(leer, que="El historial") or []
+    except Aviso:
+        raise
     except Exception as e:
         raise Aviso("No se pudo leer el historial: %s" % e, 500)
 
@@ -552,7 +601,9 @@ def operar():
     minutos = VENCIMIENTOS.get(str(d.get("vencimiento") or "M1").upper(), 1)
     lado = "put" if str(d.get("direccion") or "call").lower() == "put" else "call"
     try:
-        ok, ident = api.buy(monto, par, lado, minutos)
+        ok, ident = con_tope(lambda: api.buy(monto, par, lado, minutos), que="La orden")
+    except Aviso:
+        raise
     except Exception as e:
         raise Aviso("El bróker rechazó la orden: %s" % e, 500)
     if not ok:
@@ -560,6 +611,108 @@ def operar():
     return jsonify({"ok": True, "orden": str(ident), "par": par,
                     "direccion": lado, "monto": monto,
                     "vencimiento": d.get("vencimiento") or "M1"})
+
+
+# ------------------------------------------------------------
+# ENTRAR CON CORREO Y CONTRASEÑA DEL BRÓKER
+# Igual que en la web del bróker: si pide código por SMS, se
+# hace en dos pasos. La contraseña solo se usa aquí, para pedir
+# el SSID; no se guarda en ningún lado.
+# ------------------------------------------------------------
+AUTH = {"exnova": "https://auth.trade.exnova.com/api/v2",
+        "iqoption": "https://auth.iqoption.com/api/v2"}
+REFERER = {"exnova": "https://trade.exnova.com/en/login",
+           "iqoption": "https://iqoption.com/en/login"}
+NAVEGADOR = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+             "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+
+
+def _json(r):
+    try:
+        return r.json()
+    except Exception:
+        return {}
+
+
+def _motivo(j, por_defecto):
+    txt = ""
+    if isinstance(j, dict):
+        txt = str(j.get("message") or j.get("code") or "")
+        errs = j.get("errors")
+        if not txt and isinstance(errs, list) and errs:
+            txt = str(errs[0].get("title") or errs[0].get("code") or "")
+    t = txt.lower()
+    if "invalid" in t or "credential" in t or "password" in t or "not found" in t:
+        return "Correo o contraseña incorrectos"
+    if "block" in t:
+        return "El bróker bloqueó la cuenta temporalmente. Entra a su web para revisarla."
+    if "many" in t or "limit" in t:
+        return "Demasiados intentos. Espera unos minutos y vuelve a probar."
+    return por_defecto + (" (" + txt + ")" if txt else "")
+
+
+@application.post("/login")
+def login():
+    import requests
+    revisar_token()
+    d = datos()
+    broker = d.get("broker") if d.get("broker") in AUTH else "exnova"
+    email = str(d.get("email") or "").strip()
+    clave = str(d.get("password") or "")
+    codigo = str(d.get("codigo") or "").strip()
+    token_sms = str(d.get("tokenSms") or "").strip()
+    if not email or not clave:
+        raise Aviso("Escribe el correo y la contraseña de tu cuenta del bróker")
+
+    base = AUTH[broker]
+    s = requests.Session()
+    s.headers.update({"User-Agent": NAVEGADOR, "Referer": REFERER[broker],
+                      "Accept": "application/json"})
+    datos_login = {"identifier": email, "password": clave}
+
+    try:
+        if codigo:
+            # paso 2: el código que llegó por SMS
+            if not token_sms:
+                raise Aviso("Vuelve a pedir el código")
+            r = s.post(base + "/verify/2fa", json={"code": codigo, "token": token_sms}, timeout=15)
+            j = _json(r)
+            if j.get("code") != "success" or not j.get("token"):
+                t = str(j.get("message") or j.get("code") or "").lower()
+                if "many" in t or "limit" in t:
+                    raise Aviso("Demasiados intentos. Espera unos minutos y vuelve a probar.")
+                raise Aviso("El código no es correcto o ya venció. Revisa el SMS o empieza de nuevo.")
+            datos_login["token"] = j["token"]
+
+        r = s.post(base + "/login", data=datos_login, timeout=15)
+        j = _json(r)
+        ssid = r.cookies.get("ssid") or s.cookies.get("ssid") or (j.get("ssid") if isinstance(j, dict) else None)
+
+        if not ssid and isinstance(j, dict) and j.get("code") == "verify" and j.get("token") and not codigo:
+            # el bróker pide código: se lo pedimos que lo mande por SMS
+            r2 = s.post(base + "/verify/2fa", json={"method": "sms", "token": j["token"]}, timeout=15)
+            j2 = _json(r2)
+            if not j2.get("token"):
+                raise Aviso(_motivo(j2, "El bróker pidió un código pero no lo pudo enviar"))
+            return jsonify({"ok": True, "necesitaCodigo": True, "tokenSms": j2["token"],
+                            "mensaje": "Te llegó un código por SMS. Escríbelo para terminar."})
+        if not ssid:
+            raise Aviso(_motivo(j, "El bróker no dejó entrar"))
+    except Aviso:
+        raise
+    except requests.RequestException as e:
+        raise Aviso("No se pudo hablar con el bróker: %s" % e.__class__.__name__, 502)
+
+    # con el SSID ya en la mano, se saca el ID de la cuenta del bróker
+    perfil = {}
+    try:
+        api = cliente(broker, ssid, "demo")
+        perfil = con_tope(lambda: _perfil(api), limite=12, que="El perfil") or {}
+    except Exception as e:                       # noqa: BLE001
+        log.warning("no se pudo leer el perfil tras el login: %s", e)
+    return jsonify({"ok": True, "ssid": ssid, "brokerId": str(perfil.get("id") or ""),
+                    "nombre": perfil.get("nombre") or ""})
+
 
 
 @application.post("/cerrar")
@@ -574,6 +727,33 @@ def cerrar():
         except Exception:
             pass
     return jsonify({"ok": True})
+
+
+# ------------------------------------------------------------
+# MOTOR AUTOMÁTICO (bot de señales y copy trading) — ver motor.py
+# ------------------------------------------------------------
+import motor as _motor
+
+
+def _registro(broker, ssid):
+    with _candado:
+        return _conexiones.get(_llave(broker, ssid))
+
+
+_motor.instalar(cliente, _registro, con_tope, Aviso)
+
+
+@application.post("/motor/resultados")
+def motor_resultados():
+    revisar_token()
+    return jsonify(_motor.resultados(datos().get("ack") or []))
+
+
+@application.post("/motor/encargar")
+def motor_encargar():
+    revisar_token()
+    d = datos()
+    return jsonify(_motor.encargar(d.get("trabajos") or [], d.get("copias")))
 
 
 # arranque suelto, para probar en tu computadora o en un VPS
